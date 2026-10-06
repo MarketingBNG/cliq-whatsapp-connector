@@ -15,6 +15,23 @@ const mcpUrl = new URL("/mcp", baseUrl);
 const app = express();
 app.set("trust proxy", 1); // behind the hosting platform's HTTPS proxy
 
+// One log line per request (path only, never query strings or tokens). OAuth errors are JSON bodies,
+// so capture their error code too, which is what you need when a sign-in fails.
+app.use((req, res, next) => {
+  const start = Date.now();
+  const send = res.send.bind(res);
+  let oauthError = "";
+  res.send = (body: any) => {
+    if (res.statusCode >= 400 && typeof body === "string" && body.includes('"error"')) oauthError = body.slice(0, 200);
+    return send(body);
+  };
+  res.on("finish", () => {
+    const loc = res.statusCode === 302 ? ` -> ${String(res.getHeader("location") ?? "").split("?")[0]}` : "";
+    console.log(`${req.method} ${req.path} ${res.statusCode} ${Date.now() - start}ms${loc} ${oauthError}`.trim());
+  });
+  next();
+});
+
 app.use(
   mcpAuthRouter({
     provider,

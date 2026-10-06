@@ -123,11 +123,15 @@ export const provider: OAuthServerProvider = {
 // then send the user back to Claude with our own sealed authorization code.
 export async function zohoCallback(req: Request, res: Response) {
   const pending = unseal<Pending>(String(req.query.state ?? ""));
-  if (!pending || pending.exp < now()) return void res.status(400).send("Sign-in expired. Please try connecting again.");
+  if (!pending || pending.exp < now()) {
+    console.error("zoho callback: state missing, invalid or expired (SECRET_KEY changed?)");
+    return void res.status(400).send("Sign-in expired. Please try connecting again.");
+  }
 
   const back = new URL(pending.ru);
   if (pending.st) back.searchParams.set("state", pending.st);
   if (req.query.error || !req.query.code) {
+    console.error(`zoho callback: Zoho returned error=${req.query.error ?? "no code"}`);
     back.searchParams.set("error", "access_denied");
     return void res.redirect(back.toString());
   }
@@ -146,12 +150,14 @@ export async function zohoCallback(req: Request, res: Response) {
   });
   const body = (await r.json()) as { refresh_token?: string; error?: string };
   if (!body.refresh_token) {
+    console.error(`zoho callback: token exchange at ${as} failed: status=${r.status} error=${body.error ?? "no refresh_token"}`);
     back.searchParams.set("error", "server_error");
     back.searchParams.set("error_description", `Zoho sign-in failed: ${body.error ?? r.status}`);
     return void res.redirect(back.toString());
   }
 
   const code = seal({ t: "code", cid: pending.cid, ru: pending.ru, cc: pending.cc, rt: body.refresh_token, as, exp: now() + CODE_TTL } satisfies Code);
+  console.log(`zoho callback: signed in via ${as}, returning to ${back.origin}${back.pathname}`);
   back.searchParams.set("code", code);
   res.redirect(back.toString());
 }
