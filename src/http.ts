@@ -6,7 +6,7 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { mcpAuthRouter, getOAuthProtectedResourceMetadataUrl } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { baseUrl as getBaseUrl } from "./config.js";
-import { provider, zohoCallback, zohoCallbackPath, userFromAuth } from "./oauth/provider.js";
+import { provider, zohoCallback, zohoCallbackPath, legacyCallbackPath, userFromAuth } from "./oauth/provider.js";
 import { buildServer } from "./tools.js";
 
 const baseUrl = new URL(getBaseUrl());
@@ -41,7 +41,7 @@ app.use(
     resourceName: "Zoho Cliq",
   }),
 );
-app.get(zohoCallbackPath, (req, res, next) => zohoCallback(req, res).catch(next));
+app.get([zohoCallbackPath, legacyCallbackPath], (req, res, next) => zohoCallback(req, res).catch(next));
 app.get("/", (_req, res) => res.send(`Zoho Cliq MCP connector. Add ${mcpUrl} as a custom connector in Claude.`));
 
 const auth = requireBearerAuth({ verifier: provider, resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(mcpUrl) });

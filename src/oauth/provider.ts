@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { randomBytes } from "node:crypto";
 import type { Request, Response } from "express";
 import type { OAuthServerProvider, AuthorizationParams } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
@@ -11,7 +11,10 @@ import { accountsUrl, type ZohoUser } from "../zoho/auth.js";
 
 // Claude (or any MCP client) talks OAuth to *this* server; we bounce the user to Zoho to sign in.
 // Zoho has no dynamic client registration, so we act as the authorization server ourselves and wrap
-// each user's Zoho refresh token inside our own sealed tokens. Nothing is stored server-side.
+// each user's Zoho refresh token inside our own sealed tokens, so no database is needed.
+// The short-lived steps that travel in browser URLs (Zoho `state`, our auth code) are short random ids
+// held in memory for a few minutes, like a normal OAuth server. Long opaque blobs in post-login URLs
+// trip Chrome's phishing heuristics.
 
 const ACCESS_TTL = 3600;
 const CODE_TTL = 300;
@@ -21,33 +24,34 @@ const zohoScopes = () =>
     .concat(allowSend() ? ["ZohoCliq.Webhooks.CREATE"] : [])
     .join(",");
 
-export const zohoCallbackPath = "/oauth/zoho/callback";
+export const zohoCallbackPath = "/callback";
+export const legacyCallbackPath = "/oauth/zoho/callback";
 const callbackUrl = () => baseUrl().replace(/\/$/, "") + zohoCallbackPath;
 const now = () => Math.floor(Date.now() / 1000);
 
 interface Pending { cid: string; ru: string; cc: string; st?: string; exp: number }
-interface Code { t: "code"; cid: string; ru: string; cc: string; rt: string; as: string; exp: number }
+interface Code { cid: string; ru: string; cc: string; rt: string; as: string; exp: number }
 interface Token { t: "access" | "refresh"; cid: string; rt: string; as: string; exp?: number }
 
-// Auth codes must be single-use; remember spent ones until they would have expired anyway.
-const spentCodes = new Map<string, number>();
-function spendCode(code: string) {
-  const h = createHash("sha256").update(code).digest("hex");
+// In-flight sign-ins and unredeemed codes. Lost on restart, which only means retrying that one sign-in.
+const pendingLogins = new Map<string, Pending>();
+const authCodes = new Map<string, Code>();
+const newId = () => randomBytes(18).toString("base64url");
+function sweep() {
   const t = now();
-  for (const [k, exp] of spentCodes) if (exp < t) spentCodes.delete(k);
-  if (spentCodes.has(h)) throw new InvalidGrantError("Authorization code already used");
-  spentCodes.set(h, t + CODE_TTL);
+  for (const m of [pendingLogins, authCodes] as Map<string, { exp: number }>[]) for (const [k, v] of m) if (v.exp < t) m.delete(k);
 }
 
 const clientsStore: OAuthRegisteredClientsStore = {
   // The client id *is* the sealed registration, so no client table is needed.
+  // Only the fields we need are sealed, to keep the id (which appears in /authorize URLs) short.
   getClient: (id) => {
-    const c = unseal<OAuthClientInformationFull>(id.replace(/^c_/, ""));
-    return c && { ...c, client_id: id };
+    const c = unseal<{ r: string[]; m?: string; s?: string; i: number }>(id.replace(/^c_/, ""));
+    return c && { client_id: id, redirect_uris: c.r, token_endpoint_auth_method: c.m, client_secret: c.s, client_id_issued_at: c.i };
   },
   registerClient: (client) => {
     const issued = { ...client, client_id_issued_at: now() } as OAuthClientInformationFull;
-    issued.client_id = "c_" + seal({ ...issued, client_id: "" });
+    issued.client_id = "c_" + seal({ r: client.redirect_uris, m: client.token_endpoint_auth_method, s: client.client_secret, i: issued.client_id_issued_at });
     return issued;
   },
 };
@@ -65,13 +69,9 @@ export const provider: OAuthServerProvider = {
   clientsStore,
 
   async authorize(client, params: AuthorizationParams, res: Response) {
-    const state = seal({
-      cid: client.client_id,
-      ru: params.redirectUri,
-      cc: params.codeChallenge,
-      st: params.state,
-      exp: now() + 600,
-    } satisfies Pending);
+    sweep();
+    const state = newId();
+    pendingLogins.set(state, { cid: client.client_id, ru: params.redirectUri, cc: params.codeChallenge, st: params.state, exp: now() + 600 });
     const url = new URL(`${accountsUrl()}/oauth/v2/auth`);
     url.search = new URLSearchParams({
       response_type: "code",
@@ -86,16 +86,16 @@ export const provider: OAuthServerProvider = {
   },
 
   async challengeForAuthorizationCode(client, code) {
-    const c = unseal<Code>(code);
-    if (c?.t !== "code" || c.cid !== client.client_id) throw new InvalidGrantError("Invalid authorization code");
+    const c = authCodes.get(code);
+    if (!c || c.cid !== client.client_id) throw new InvalidGrantError("Invalid authorization code");
     return c.cc;
   },
 
   async exchangeAuthorizationCode(client, code, _verifier, redirectUri) {
-    const c = unseal<Code>(code);
-    if (c?.t !== "code" || c.cid !== client.client_id || c.exp < now()) throw new InvalidGrantError("Invalid or expired code");
+    const c = authCodes.get(code);
+    authCodes.delete(code); // single use
+    if (!c || c.cid !== client.client_id || c.exp < now()) throw new InvalidGrantError("Invalid or expired code");
     if (redirectUri && redirectUri !== c.ru) throw new InvalidGrantError("redirect_uri mismatch");
-    spendCode(code);
     return issueTokens(c.cid, c.rt, c.as);
   },
 
@@ -122,9 +122,11 @@ export const provider: OAuthServerProvider = {
 // Zoho redirects here after the user signs in. We swap Zoho's code for a refresh token,
 // then send the user back to Claude with our own sealed authorization code.
 export async function zohoCallback(req: Request, res: Response) {
-  const pending = unseal<Pending>(String(req.query.state ?? ""));
+  const stateId = String(req.query.state ?? "");
+  const pending = pendingLogins.get(stateId);
+  pendingLogins.delete(stateId);
   if (!pending || pending.exp < now()) {
-    console.error("zoho callback: state missing, invalid or expired (SECRET_KEY changed?)");
+    console.error("zoho callback: unknown or expired state (server restarted mid sign-in?)");
     return void res.status(400).send("Sign-in expired. Please try connecting again.");
   }
 
@@ -137,7 +139,12 @@ export async function zohoCallback(req: Request, res: Response) {
   }
 
   // Zoho tells us which data centre the user's account lives in (multi-DC must be enabled on the client).
+  // Only ever send our client secret to a real Zoho accounts server.
   const as = String(req.query["accounts-server"] ?? accountsUrl()).replace(/\/$/, "");
+  if (!/^https:\/\/accounts\.zoho\.(com|in|eu|com\.au|jp|ca|sa|uk|com\.cn)$/.test(as)) {
+    console.error(`zoho callback: rejected unexpected accounts-server ${as}`);
+    return void res.status(400).send("Unexpected Zoho accounts server.");
+  }
   const r = await fetch(`${as}/oauth/v2/token`, {
     method: "POST",
     body: new URLSearchParams({
@@ -156,7 +163,8 @@ export async function zohoCallback(req: Request, res: Response) {
     return void res.redirect(back.toString());
   }
 
-  const code = seal({ t: "code", cid: pending.cid, ru: pending.ru, cc: pending.cc, rt: body.refresh_token, as, exp: now() + CODE_TTL } satisfies Code);
+  const code = newId();
+  authCodes.set(code, { cid: pending.cid, ru: pending.ru, cc: pending.cc, rt: body.refresh_token, as, exp: now() + CODE_TTL });
   console.log(`zoho callback: signed in via ${as}, returning to ${back.origin}${back.pathname}`);
   back.searchParams.set("code", code);
   res.redirect(back.toString());

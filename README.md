@@ -18,7 +18,7 @@ WhatsApp support will be added later.
 
 ## How sign-in works
 ```
-Claude ──► /authorize (this server) ──► Zoho login & consent ──► /oauth/zoho/callback
+Claude ──► /authorize (this server) ──► Zoho login & consent ──► /callback
        ◄── our code ◄────────────────────────────────────────────┘
 Claude ──► /token  →  access/refresh token (encrypted, contains the user's Zoho refresh token)
 Claude ──► /mcp  (Bearer token)  →  Cliq API as that user
@@ -28,7 +28,7 @@ Zoho doesn't let Claude register itself as a client, so this server acts as the 
 ## Admin setup (one time)
 1. **Create a Zoho client.** At https://api-console.zoho.com, choose **Add Client → Server-based Applications**.
    - Homepage URL: your `BASE_URL`.
-   - Authorized Redirect URI: `<BASE_URL>/oauth/zoho/callback`.
+   - Authorized Redirect URI: `<BASE_URL>/callback`.
    - In the client's **Settings**, turn on **multi-DC** so people with accounts in other data centres (.in, .com, .eu and so on) can sign in.
 2. **Host the server** anywhere that gives you a public HTTPS URL, such as Render, Railway, Fly.io, a VPS or Azure App Service.
    - Build: `npm install && npm run build`
@@ -44,7 +44,7 @@ In Claude Code, run `claude mcp add --transport http zoho-cliq <BASE_URL>/mcp` a
 People only see chats they are members of in Cliq.
 
 ## Local testing
-- **Hosted mode on your machine:** set `BASE_URL=http://localhost:3000` and add `http://localhost:3000/oauth/zoho/callback` as a redirect URI on the Zoho client. Run `npm start`, then `npm run inspect` and connect to `http://localhost:3000/mcp`.
+- **Hosted mode on your machine:** set `BASE_URL=http://localhost:3000` and add `http://localhost:3000/callback` as a redirect URI on the Zoho client. Run `npm start`, then `npm run inspect` and connect to `http://localhost:3000/mcp`.
 - **Single-user stdio mode, no hosting:** create a Self Client and generate a code with the `ZohoCliq.*.READ` scopes. Run `npm run token -- <code>`, put the refresh token in `.env`, then run `npm run start:local`.
 
 ## Notes
