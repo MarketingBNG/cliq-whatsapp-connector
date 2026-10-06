@@ -9,9 +9,10 @@ WhatsApp support will be added later.
 ## Tools
 | Tool | What it does |
 |---|---|
-| `list_chats` | DMs, groups and channels the signed-in user is in |
+| `list_chats` | DMs, groups and channels the signed-in user is in; filter by `name` |
 | `list_channels` | Cliq channels |
-| `get_messages` | Messages from one chat (optional from/to window) |
+| `get_messages` | Up to 100 messages from one chat (optional from/to window) |
+| `get_chat_history` | **Full history** of 1–10 chats, paged back automatically (up to 5,000 per chat per call; continue for more) |
 | `recent_activity` | Every message across active chats in the last N hours |
 | `search_messages` | Text or sender search over the last N hours |
 | `send_message` | Post to a chat. Only available when `CLIQ_ALLOW_SEND=true` |

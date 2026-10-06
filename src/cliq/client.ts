@@ -79,6 +79,34 @@ export async function getMessages(user: ZohoUser, chatId: string, opts: { from?:
   }));
 }
 
+// Full history of one chat: pages backwards from `to` in 100-message steps until it reaches `from`,
+// runs out of messages, or hits `max`. Returned oldest first. `before` lets the caller continue.
+export async function getHistory(
+  user: ZohoUser,
+  chatId: string,
+  opts: { from?: Date; to?: Date; max: number },
+): Promise<{ messages: Message[]; truncated: boolean; before?: string }> {
+  const seen = new Map<string, Message>();
+  let to = opts.to;
+  while (seen.size < opts.max) {
+    const page = await getMessages(user, chatId, { from: opts.from, to, limit: MAX_PAGE });
+    const fresh = page.filter((m) => !seen.has(m.id));
+    fresh.forEach((m) => seen.set(m.id, m));
+    const oldest = fresh.map((m) => Date.parse(m.time)).filter((t) => !isNaN(t)).sort((a, b) => a - b)[0];
+    // Stop when Cliq has nothing older for us (short page, no new ids, or no usable timestamps).
+    if (page.length < MAX_PAGE || fresh.length === 0 || oldest === undefined) {
+      return { messages: sortAsc([...seen.values()]), truncated: false };
+    }
+    if (opts.from && oldest <= opts.from.getTime()) break;
+    to = new Date(oldest - 1);
+  }
+  const messages = sortAsc([...seen.values()]).slice(-opts.max);
+  const truncated = !opts.from || Date.parse(messages[0]?.time) > opts.from.getTime();
+  return { messages, truncated, before: truncated ? messages[0]?.time : undefined };
+}
+
+const sortAsc = (ms: Message[]) => ms.sort((a, b) => a.time.localeCompare(b.time));
+
 export async function sendMessage(user: ZohoUser, chatId: string, text: string) {
   return call(user, `/chats/${encodeURIComponent(chatId)}/message`, { method: "POST", body: JSON.stringify({ text }) });
 }
