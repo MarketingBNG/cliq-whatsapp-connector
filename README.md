@@ -9,6 +9,7 @@ WhatsApp support will be added later.
 ## Tools
 | Tool | What it does |
 |---|---|
+| `summarize_chat` | **One step:** finds the chat by name, pulls history (default last 30 days), opens screenshots/files, redacts, returns a fixed short summary format |
 | `list_chats` | DMs, groups and channels the signed-in user is in; filter by `name` |
 | `list_channels` | Cliq channels |
 | `get_messages` | Up to 100 messages from one chat (optional from/to window) |

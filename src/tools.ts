@@ -13,6 +13,9 @@ export type UserResolver = (authInfo?: AuthInfo) => ZohoUser;
 // Sent to Claude once per connection; it shapes every answer built from this connector.
 const INSTRUCTIONS = `Zoho Cliq connector. Rules for answers built from Cliq data:
 
+WHICH TOOL
+- "Summarise / brief me on / catch me up on my chat with X" -> call summarize_chat once with name=X. It already includes history, files and redaction; don't chain other tools unless the user asks for more.
+
 STYLE
 - Be brief. Lead with the answer in one line, then short bullets. No long paragraphs, no filler, no restating the request.
 - Summaries: group by chat or topic; one bullet per decision, action item or open question; name who owns each action and any date.
@@ -61,8 +64,100 @@ async function recent(user: ZohoUser, hours: number, perChat: number): Promise<M
   return batches.flat().sort((a, b) => b.time.localeCompare(a.time));
 }
 
+// Fixed answer shape for summarize_chat, so summaries come out short and consistent.
+const SUMMARY_FORMAT = `HOW TO ANSWER (keep it short, bullets only, no paragraphs):
+**<Chat name>** - <one-line gist> (<N> messages, <first date> to <last date>)
+**Decisions** - one bullet each
+**Action items** - "<owner>: <task> (due <date>)", one bullet each; include tasks found in screenshots/files
+**Open questions / waiting on** - one bullet each
+**Files** - one bullet per file that mattered, with what it contained (skip trivial ones)
+**Security** - only if redactions were reported: "Credentials were shared in plain text; rotate them." (never show values)
+Omit any section that would be empty.`;
+
+type Part = { type: "text"; text: string } | { type: "image"; data: string; mimeType: string };
+
+// Open attachments as the user and convert them; failures become a one-line note instead of an error.
+async function readFiles(user: ZohoUser, refs: string[], reveal: boolean): Promise<{ parts: Part[]; found: Record<string, number> }> {
+  const found: Record<string, number> = {};
+  const parts = await mapLimit(refs, 3, async (ref): Promise<Part[]> => {
+    try {
+      const a = await findAttachment(user, ref);
+      const r = await toContent(a, await downloadFile(user, a, MAX_FILE_BYTES), reveal);
+      for (const [k, v] of Object.entries(r.found)) found[k] = (found[k] ?? 0) + v;
+      return r.content;
+    } catch (e) {
+      return [{ type: "text", text: `--- ${ref}: could not read (${(e as Error).message})` }];
+    }
+  });
+  return { parts: parts.flat(), found };
+}
+
+const merge = (a: Record<string, number>, b: Record<string, number>) => {
+  for (const [k, v] of Object.entries(b)) a[k] = (a[k] ?? 0) + v;
+  return a;
+};
+
 export function buildServer(resolve: UserResolver): McpServer {
-  const server = new McpServer({ name: "zoho-cliq", version: "0.3.0" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "zoho-cliq", version: "0.4.0" }, { instructions: INSTRUCTIONS });
+
+  server.tool(
+    "summarize_chat",
+    "ONE-STEP chat summary. Use this whenever the user asks to summarise / brief / catch up on a chat with a person, group or channel. " +
+      "Finds the chat by name, pulls its history, automatically opens screenshots and files, redacts secrets, and returns everything with the answer format to follow.",
+    {
+      name: z.string().min(1).describe("Person, group or channel name, e.g. 'Karan'"),
+      from: z.string().optional().describe("ISO start time; default: last 30 days"),
+      to: z.string().optional().describe("ISO end time; default: now"),
+      max_messages: z.number().int().min(1).max(3000).default(1000),
+      max_files: z.number().int().min(0).max(25).default(15).describe("How many attachments to open (newest first)"),
+    },
+    async ({ name, from, to, max_messages, max_files }, { authInfo }) => {
+      const user = resolve(authInfo);
+      const text = (t: string): Part => ({ type: "text", text: t });
+
+      // 1. Find the chat. Prefer an exact name match; if still ambiguous, ask instead of guessing.
+      const q = name.toLowerCase();
+      const all = await listChats(user, 100);
+      const hits = all.filter((c) => c.name?.toLowerCase().includes(q));
+      const exact = hits.filter((c) => c.name?.toLowerCase() === q);
+      const pick = exact.length === 1 ? exact : hits;
+      if (pick.length === 0) return { content: [text(`No chat matching "${name}" among your 100 most recent chats. Ask the user for the exact chat name.`)] };
+      if (pick.length > 1)
+        return { content: [text(`Several chats match "${name}". Ask the user which one (one short question), then call again with the exact name:\n` + pick.map((c) => `- ${c.name} (${c.type})`).join("\n"))] };
+      const chat = pick[0];
+
+      // 2. History for the period (default: last 30 days), redacted.
+      const fromD = from ? new Date(from) : new Date(Date.now() - 30 * 86400_000);
+      const h = await getHistory(user, chat.id, { from: fromD, to: to ? new Date(to) : undefined, max: max_messages });
+      const msgs = redactAll(h.messages, false);
+      const found = { ...msgs.found };
+
+      // 3. Open attachments automatically, newest first.
+      const refs = msgs.items.flatMap((m) => (m.attachments ?? []).map((a) => a.ref!)).filter(Boolean);
+      const chosen = refs.slice(-max_files).reverse();
+      const files = chosen.length ? await readFiles(user, chosen, false) : { parts: [], found: {} };
+      merge(found, files.found);
+
+      const period = msgs.items.length
+        ? `${msgs.items[0].time.slice(0, 10)} to ${msgs.items.at(-1)!.time.slice(0, 10)}`
+        : `${fromD.toISOString().slice(0, 10)} to now`;
+      const skipped = refs.length - chosen.length;
+      const header =
+        `CHAT: ${chat.name} | ${msgs.items.length} messages | ${period}` +
+        (h.truncated ? " | older messages exist (call again with an earlier `from` if the user wants them)" : "") +
+        ` | files: ${chosen.length} opened` + (skipped > 0 ? `, ${skipped} older not opened` : "");
+
+      const notice = redactionNotice(found);
+      return {
+        content: [
+          text(SUMMARY_FORMAT),
+          ...(notice ? [text(notice)] : []),
+          text(`${header}\n\n${msgs.items.map(line).join("\n") || "(no messages in this period)"}`),
+          ...(files.parts.length ? [text("ATTACHMENTS:"), ...files.parts] : []),
+        ],
+      };
+    },
+  );
 
   server.tool(
     "list_chats",
@@ -180,20 +275,9 @@ export function buildServer(resolve: UserResolver): McpServer {
       "Pass the `ref` values shown as [file: name ref=...] in message results. Text is redacted like messages.",
     { refs: z.array(z.string()).min(1).max(10), reveal_sensitive: reveal },
     async ({ refs, reveal_sensitive }, { authInfo }) => {
-      const user = resolve(authInfo);
-      const found: Record<string, number> = {};
-      const parts = await mapLimit(refs, 3, async (ref) => {
-        try {
-          const a = await findAttachment(user, ref);
-          const r = await toContent(a, await downloadFile(user, a, MAX_FILE_BYTES), reveal_sensitive);
-          for (const [k, v] of Object.entries(r.found)) found[k] = (found[k] ?? 0) + v;
-          return r.content;
-        } catch (e) {
-          return [{ type: "text" as const, text: `--- ${ref}: could not read (${(e as Error).message})` }];
-        }
-      });
-      const notice = redactionNotice(found);
-      return { content: [...(notice ? [{ type: "text" as const, text: notice }] : []), ...parts.flat()] };
+      const r = await readFiles(resolve(authInfo), refs, reveal_sensitive);
+      const notice = redactionNotice(r.found);
+      return { content: [...(notice ? [{ type: "text" as const, text: notice }] : []), ...r.parts] };
     },
   );
 
