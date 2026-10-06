@@ -14,7 +14,30 @@ export interface Message {
   sender: string;
   time: string;
   text: string;
-  attachments?: string[];
+  attachments?: Attachment[];
+}
+
+export interface Attachment {
+  id?: string;
+  name: string;
+  type?: string;
+  size?: number;
+  url?: string;
+  // Short handle Claude passes to read_attachments: chatId~messageId~timeMs~index.
+  ref?: string;
+}
+
+// Cliq puts uploaded files under content.file (sometimes content.files / attachments); read them all.
+function attachmentsOf(m: any): Attachment[] | undefined {
+  const raw = [m.content?.file, ...(m.content?.files ?? []), ...(m.attachments ?? []), m.file].filter(Boolean);
+  const list = raw.map((f: any) => ({
+    id: f.id ?? f.file_id,
+    name: f.name ?? f.file_name ?? "file",
+    type: f.type ?? f.content_type ?? f.mime_type,
+    size: f.size ?? f.file_size,
+    url: f.url ?? f.download_url,
+  }));
+  return list.length ? list : undefined;
 }
 
 // All calls run as one signed-in Zoho user, so each person only ever sees their own chats.
@@ -69,14 +92,27 @@ export async function getMessages(user: ZohoUser, chatId: string, opts: { from?:
   if (opts.from) q.set("fromtime", String(opts.from.getTime()));
   if (opts.to) q.set("totime", String(opts.to.getTime()));
   const body = await call(user, `/chats/${encodeURIComponent(chatId)}/messages?${q}`);
-  return (body.data ?? body.messages ?? []).map((m: any) => ({
-    id: String(m.id),
-    chatId,
-    sender: m.sender?.name ?? m.sender?.id ?? "unknown",
-    time: iso(m.time) ?? "",
-    text: m.content?.text ?? m.content?.comment ?? (typeof m.content === "string" ? m.content : ""),
-    attachments: m.content?.file ? [m.content.file.name] : undefined,
-  }));
+  return (body.data ?? body.messages ?? []).map((m: any) => {
+    const time = iso(m.time) ?? "";
+    return {
+      id: String(m.id),
+      chatId,
+      sender: m.sender?.name ?? m.sender?.id ?? "unknown",
+      time,
+      text: m.content?.text ?? m.content?.comment ?? (typeof m.content === "string" ? m.content : ""),
+      attachments: attachmentsOf(m)?.map((a, i) => ({ ...a, ref: [chatId, m.id, Date.parse(time) || 0, i].join("~") })),
+    };
+  });
+}
+
+// Re-fetch the message a ref points at (refs carry its time, so one small page finds it) and return the file.
+export async function findAttachment(user: ZohoUser, ref: string): Promise<Attachment> {
+  const [chatId, msgId, t, idx] = ref.split("~");
+  if (!chatId || !msgId) throw new Error(`Bad attachment ref: ${ref}`);
+  const page = await getMessages(user, chatId, { to: t && Number(t) ? new Date(Number(t) + 1000) : undefined, limit: 50 });
+  const a = page.find((m) => m.id === msgId)?.attachments?.[Number(idx) || 0];
+  if (!a) throw new Error(`Attachment not found for ref ${ref}`);
+  return a;
 }
 
 // Full history of one chat: pages backwards from `to` in 100-message steps until it reaches `from`,
@@ -106,6 +142,24 @@ export async function getHistory(
 }
 
 const sortAsc = (ms: Message[]) => ms.sort((a, b) => a.time.localeCompare(b.time));
+
+// Download an attachment's bytes as the signed-in user. Uses the file's own URL when Cliq gives one,
+// otherwise the files endpoint.
+export async function downloadFile(user: ZohoUser, f: Attachment, maxBytes: number): Promise<{ data: Buffer; contentType: string }> {
+  for (let attempt = 0; attempt < 2; attempt++) {
+    const token = await getAccessToken(user, attempt > 0);
+    const url = f.url ?? `${cliqBase(user)}/files/${encodeURIComponent(f.id ?? "")}`;
+    const res = await fetch(url, { headers: { Authorization: `Zoho-oauthtoken ${token}` } });
+    if (res.status === 401 && attempt === 0) continue;
+    if (!res.ok) throw new Error(`Download of ${f.name} failed: ${res.status}`);
+    const len = Number(res.headers.get("content-length") ?? 0);
+    if (len > maxBytes) throw new Error(`${f.name} is ${(len / 1e6).toFixed(1)} MB; the limit is ${maxBytes / 1e6} MB`);
+    const data = Buffer.from(await res.arrayBuffer());
+    if (data.length > maxBytes) throw new Error(`${f.name} is too large (${(data.length / 1e6).toFixed(1)} MB)`);
+    return { data, contentType: (res.headers.get("content-type") ?? f.type ?? "").split(";")[0] };
+  }
+  throw new Error(`Download of ${f.name} failed`);
+}
 
 export async function sendMessage(user: ZohoUser, chatId: string, text: string) {
   return call(user, `/chats/${encodeURIComponent(chatId)}/message`, { method: "POST", body: JSON.stringify({ text }) });

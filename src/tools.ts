@@ -3,7 +3,8 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { z } from "zod";
 import { allowSend } from "./config.js";
 import type { ZohoUser } from "./zoho/auth.js";
-import { listChats, listChannels, getMessages, getHistory, sendMessage, mapLimit, type Message } from "./cliq/client.js";
+import { listChats, listChannels, getMessages, getHistory, sendMessage, mapLimit, findAttachment, downloadFile, type Message } from "./cliq/client.js";
+import { toContent, MAX_FILE_BYTES } from "./files.js";
 import { redactAll, redactionNotice } from "./redact.js";
 
 // Works out which Zoho user a tool call runs as: from the OAuth token (remote) or from .env (local stdio).
@@ -17,6 +18,9 @@ STYLE
 - Summaries: group by chat or topic; one bullet per decision, action item or open question; name who owns each action and any date.
 - Quote a message only when exact wording matters, and keep quotes short.
 - Mention how many messages or which period you covered in one short line, not a paragraph.
+
+FILES
+- Messages may carry screenshots, PDFs or documents, shown as [file: name ref=...]. If they could hold tasks, decisions or numbers relevant to the request, open them with read_attachments (batch up to 10 refs) instead of skipping them. Say briefly if some files couldn't be read.
 
 SENSITIVE DATA
 - Secrets and personal IDs (API keys, tokens, passwords, OTPs, private keys, card numbers, SSN, PAN, Aadhaar) are replaced with [REDACTED: type] before you see them.
@@ -37,7 +41,11 @@ const reveal = z
   .describe("Show hidden secrets/IDs. ONLY true after the user explicitly asked AND confirmed after a warning.");
 
 const line = (m: Message) =>
-  `[${m.time.slice(0, 16).replace("T", " ")}] ${m.sender}: ${m.text}${m.attachments ? ` [file: ${m.attachments.join(", ")}]` : ""}`;
+  `[${m.time.slice(0, 16).replace("T", " ")}] ${m.sender}: ${m.text}` +
+  (m.attachments ?? []).map((a) => ` [file: ${a.name} ref=${a.ref}]`).join("");
+
+// Download URLs stay server-side; Claude only needs the name, type and ref.
+const publicMsg = (m: Message) => ({ ...m, attachments: m.attachments?.map(({ url, id, ...a }) => a) });
 
 // Messages from every chat active in the last `hours`, tagged with the chat name, newest first.
 async function recent(user: ZohoUser, hours: number, perChat: number): Promise<Message[]> {
@@ -91,7 +99,7 @@ export function buildServer(resolve: UserResolver): McpServer {
         limit,
       });
       const r = redactAll(msgs, reveal_sensitive);
-      return ok(r.items, redactionNotice(r.found));
+      return ok(r.items.map(publicMsg), redactionNotice(r.found));
     },
   );
 
@@ -123,7 +131,7 @@ export function buildServer(resolve: UserResolver): McpServer {
         }
       });
       const notice = redactionNotice(found);
-      if (format === "json") return ok(results, notice);
+      if (format === "json") return ok(results.map((r) => (r.messages ? { ...r, messages: r.messages.map(publicMsg) } : r)), notice);
       const text = results
         .map((r) => {
           const head = `=== ${r.chat ?? r.chat_id} (${r.chat_id})`;
@@ -146,7 +154,7 @@ export function buildServer(resolve: UserResolver): McpServer {
     },
     async ({ hours, per_chat, reveal_sensitive }, { authInfo }) => {
       const r = redactAll(await recent(resolve(authInfo), hours, per_chat), reveal_sensitive);
-      return ok(r.items, redactionNotice(r.found));
+      return ok(r.items.map(publicMsg), redactionNotice(r.found));
     },
   );
 
@@ -162,7 +170,30 @@ export function buildServer(resolve: UserResolver): McpServer {
       const hits = r.items.filter((m) => m.text.toLowerCase().includes(q) || m.sender.toLowerCase().includes(q));
       const found: Record<string, number> = {};
       for (const m of hits) for (const [, k] of m.text.matchAll(/\[REDACTED: ([^\]]+)\]/g)) found[k] = (found[k] ?? 0) + 1;
-      return ok(hits, redactionNotice(found));
+      return ok(hits.map(publicMsg), redactionNotice(found));
+    },
+  );
+
+  server.tool(
+    "read_attachments",
+    "Open files attached to Cliq messages (screenshots/images are returned as images; PDF, Word, text and CSV as extracted text). " +
+      "Pass the `ref` values shown as [file: name ref=...] in message results. Text is redacted like messages.",
+    { refs: z.array(z.string()).min(1).max(10), reveal_sensitive: reveal },
+    async ({ refs, reveal_sensitive }, { authInfo }) => {
+      const user = resolve(authInfo);
+      const found: Record<string, number> = {};
+      const parts = await mapLimit(refs, 3, async (ref) => {
+        try {
+          const a = await findAttachment(user, ref);
+          const r = await toContent(a, await downloadFile(user, a, MAX_FILE_BYTES), reveal_sensitive);
+          for (const [k, v] of Object.entries(r.found)) found[k] = (found[k] ?? 0) + v;
+          return r.content;
+        } catch (e) {
+          return [{ type: "text" as const, text: `--- ${ref}: could not read (${(e as Error).message})` }];
+        }
+      });
+      const notice = redactionNotice(found);
+      return { content: [...(notice ? [{ type: "text" as const, text: notice }] : []), ...parts.flat()] };
     },
   );
 
