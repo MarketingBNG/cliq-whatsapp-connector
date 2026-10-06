@@ -13,7 +13,7 @@ const ok = (data: unknown) => ({ content: [{ type: "text" as const, text: JSON.s
 // Messages from every chat active in the last `hours`, tagged with the chat name, newest first.
 async function recent(user: ZohoUser, hours: number, perChat: number): Promise<Message[]> {
   const since = new Date(Date.now() - hours * 3600_000);
-  const chats = (await listChats(user, 200)).filter((c) => !c.lastActivity || new Date(c.lastActivity) >= since);
+  const chats = (await listChats(user, 100)).filter((c) => !c.lastActivity || new Date(c.lastActivity) >= since);
   const batches = await mapLimit(chats, 4, async (c) => {
     try {
       return (await getMessages(user, c.id, { from: since, limit: perChat })).map((m) => ({ ...m, chat: c.name }));
@@ -32,7 +32,7 @@ export function buildServer(resolve: UserResolver): McpServer {
     "List Zoho Cliq chats (DMs, groups, channels) the signed-in user belongs to, most recent first.",
     {
       type: z.string().optional().describe("Filter by chat type, e.g. dm, chat, channel"),
-      limit: z.number().int().max(200).default(100),
+      limit: z.number().int().min(1).max(100).default(100),
     },
     async ({ type, limit }, { authInfo }) => {
       let chats = await listChats(resolve(authInfo), limit);

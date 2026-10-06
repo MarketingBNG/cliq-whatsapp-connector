@@ -33,20 +33,28 @@ async function call(user: ZohoUser, path: string, init: RequestInit = {}, attemp
   return text ? JSON.parse(text) : {};
 }
 
-const iso = (t: unknown) => (t ? new Date(Number(t)).toISOString() : undefined);
+// Cliq sends times as epoch millis (number or numeric string) or as date strings; never throw on odd values.
+const iso = (t: unknown): string | undefined => {
+  if (t === null || t === undefined || t === "") return undefined;
+  const d = typeof t === "number" || /^\d+$/.test(String(t)) ? new Date(Number(t)) : new Date(String(t));
+  return isNaN(d.getTime()) ? undefined : d.toISOString();
+};
+
+// Cliq caps page size at 100.
+const MAX_PAGE = 100;
 
 export async function listChats(user: ZohoUser, limit = 100): Promise<Chat[]> {
-  const body = await call(user, `/chats?limit=${limit}`);
+  const body = await call(user, `/chats?limit=${Math.min(limit, MAX_PAGE)}`);
   return (body.chats ?? body.data ?? []).map((c: any) => ({
     id: c.chat_id ?? c.id,
     name: c.name ?? c.title,
     type: c.chat_type ?? c.type,
-    lastActivity: iso(c.last_modified_time ?? c.last_message_time),
+    lastActivity: iso(c.last_modified_time ?? c.last_message_info?.time ?? c.last_message_time),
   }));
 }
 
 export async function listChannels(user: ZohoUser, limit = 100): Promise<any[]> {
-  const body = await call(user, `/channels?limit=${limit}`);
+  const body = await call(user, `/channels?limit=${Math.min(limit, MAX_PAGE)}`);
   return (body.channels ?? body.data ?? []).map((c: any) => ({
     id: c.channel_id ?? c.id,
     chatId: c.chat_id,
@@ -57,7 +65,7 @@ export async function listChannels(user: ZohoUser, limit = 100): Promise<any[]> 
 }
 
 export async function getMessages(user: ZohoUser, chatId: string, opts: { from?: Date; to?: Date; limit?: number } = {}): Promise<Message[]> {
-  const q = new URLSearchParams({ limit: String(opts.limit ?? 50) });
+  const q = new URLSearchParams({ limit: String(Math.min(opts.limit ?? 50, MAX_PAGE)) });
   if (opts.from) q.set("fromtime", String(opts.from.getTime()));
   if (opts.to) q.set("totime", String(opts.to.getTime()));
   const body = await call(user, `/chats/${encodeURIComponent(chatId)}/messages?${q}`);
