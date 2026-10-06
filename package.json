@@ -1,0 +1,28 @@
+{
+  "name": "zoho-cliq-mcp",
+  "version": "0.2.0",
+  "description": "MCP connector that reads Zoho Cliq chats live",
+  "type": "module",
+  "main": "dist/src/http.js",
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/src/http.js",
+    "start:local": "node dist/src/index.js",
+    "token": "node dist/scripts/get-refresh-token.js",
+    "inspect": "npx @modelcontextprotocol/inspector"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.17.0",
+    "dotenv": "^16.4.5",
+    "express": "^5.2.1",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/express": "^5.0.6",
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.0"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}

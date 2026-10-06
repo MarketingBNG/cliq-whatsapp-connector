@@ -1,0 +1,21 @@
+services:
+  - type: web
+    name: zoho-cliq-mcp
+    runtime: node
+    plan: starter # free plan sleeps when idle; the first Claude call after a nap can time out
+    buildCommand: npm ci && npm run build
+    startCommand: npm start
+    healthCheckPath: /
+    envVars:
+      - key: NODE_VERSION
+        value: "22"
+      - key: SECRET_KEY
+        generateValue: true
+      - key: ZOHO_CLIENT_ID
+        sync: false
+      - key: ZOHO_CLIENT_SECRET
+        sync: false
+      - key: ZOHO_DC
+        value: com
+      - key: CLIQ_ALLOW_SEND
+        value: "false"
