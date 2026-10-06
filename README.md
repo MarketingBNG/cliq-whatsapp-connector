@@ -17,6 +17,12 @@ WhatsApp support will be added later.
 | `search_messages` | Text or sender search over the last N hours |
 | `send_message` | Post to a chat. Only available when `CLIQ_ALLOW_SEND=true` |
 
+## Sensitive data and answer style
+- **Hidden by default:** API keys, tokens, passwords, OTPs, private keys, card numbers, SSN, PAN and Aadhaar are replaced with `[REDACTED: type]` before Claude sees them. Claude is told to warn you to rotate exposed credentials.
+- **Revealing values:** Claude only gets the real values by calling a tool with `reveal_sensitive=true`. The connector instructs it to do that only after you ask explicitly and confirm. Search runs on the redacted text, so it can't be used to dig out hidden values.
+- **Answer style:** the server sends Claude standing instructions: answer briefly, use bullets and avoid long paragraphs.
+- Detection rules live in `src/redact.ts`, and the instructions in `src/tools.ts`.
+
 ## How sign-in works
 ```
 Claude ──► /authorize (this server) ──► Zoho login & consent ──► /callback
