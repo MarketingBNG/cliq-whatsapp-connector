@@ -12,9 +12,15 @@ export interface Message {
   chatId: string;
   chat?: string;
   sender: string;
+  senderId?: string;
   time: string;
   text: string;
   attachments?: Attachment[];
+  // Set when the message answers another one (Cliq "reply"/quote). preview is filled when that message is known.
+  replyTo?: { id?: string; sender?: string; preview?: string };
+  // User ids mentioned in the text ({@id} in Cliq's markup).
+  mentions?: string[];
+  edited?: boolean;
 }
 
 export interface Attachment {
@@ -66,14 +72,52 @@ const iso = (t: unknown): string | undefined => {
 // Cliq caps page size at 100.
 const MAX_PAGE = 100;
 
-export async function listChats(user: ZohoUser, limit = 100): Promise<Chat[]> {
-  const body = await call(user, `/chats?limit=${Math.min(limit, MAX_PAGE)}`);
-  return (body.chats ?? body.data ?? []).map((c: any) => ({
-    id: c.chat_id ?? c.id,
-    name: c.name ?? c.title,
-    type: c.chat_type ?? c.type,
-    lastActivity: iso(c.last_modified_time ?? c.last_message_info?.time ?? c.last_message_time),
-  }));
+const toChat = (c: any): Chat => ({
+  id: c.chat_id ?? c.id,
+  name: c.name ?? c.title,
+  type: c.chat_type ?? c.type,
+  lastActivity: iso(c.last_modified_time ?? c.last_message_info?.time ?? c.last_message_time),
+});
+
+// The chat list changes slowly but many tools need it, so keep it for a minute per user (fewer Cliq calls).
+const CHAT_CACHE_MS = 60_000;
+const chatCache = new Map<string, { at: number; max: number; chats: Chat[] }>();
+export const clearChatCache = () => chatCache.clear();
+
+// Chats newest first. Cliq returns at most 100 per call, so this pages back (next_token when Cliq gives one,
+// otherwise modified_before the oldest chat seen) until `max` chats or no more.
+export async function listChats(user: ZohoUser, max = 1000): Promise<Chat[]> {
+  const key = user.refreshToken;
+  const hit = chatCache.get(key);
+  if (hit && Date.now() - hit.at < CHAT_CACHE_MS && (hit.max >= max || hit.chats.length < hit.max)) return hit.chats.slice(0, max);
+
+  const seen = new Map<string, Chat>();
+  let next: string | undefined;
+  let before: number | undefined;
+  for (let page = 0; page < 50 && seen.size < max; page++) {
+    const q = new URLSearchParams({ limit: String(MAX_PAGE) });
+    if (next) q.set("next_token", next);
+    else if (before) q.set("modified_before", String(before));
+    let body: any;
+    try {
+      body = await call(user, `/chats?${q}`);
+    } catch (e) {
+      // The first page must work; a later page failing (e.g. Cliq rejects the paging parameter) keeps what we have.
+      if (page === 0) throw e;
+      break;
+    }
+    const raw: any[] = body.chats ?? body.data ?? [];
+    const fresh = raw.map(toChat).filter((c) => c.id && !seen.has(c.id));
+    fresh.forEach((c) => seen.set(c.id, c));
+    next = body.next_token ?? undefined;
+    const oldest = fresh.map((c) => Date.parse(c.lastActivity ?? "")).filter((t) => !isNaN(t)).sort((a, b) => a - b)[0];
+    // Stop on a short page, no new chats (the paging param was ignored) or nothing to page by.
+    if (raw.length < MAX_PAGE || fresh.length === 0 || (!next && oldest === undefined)) break;
+    before = oldest - 1;
+  }
+  const chats = [...seen.values()].sort((a, b) => (b.lastActivity ?? "").localeCompare(a.lastActivity ?? ""));
+  chatCache.set(key, { at: Date.now(), max, chats });
+  return chats.slice(0, max);
 }
 
 export async function listChannels(user: ZohoUser, limit = 100): Promise<any[]> {
@@ -92,17 +136,48 @@ export async function getMessages(user: ZohoUser, chatId: string, opts: { from?:
   if (opts.from) q.set("fromtime", String(opts.from.getTime()));
   if (opts.to) q.set("totime", String(opts.to.getTime()));
   const body = await call(user, `/chats/${encodeURIComponent(chatId)}/messages?${q}`);
-  return (body.data ?? body.messages ?? []).map((m: any) => {
-    const time = iso(m.time) ?? "";
-    return {
-      id: String(m.id),
-      chatId,
-      sender: m.sender?.name ?? m.sender?.id ?? "unknown",
-      time,
-      text: m.content?.text ?? m.content?.comment ?? (typeof m.content === "string" ? m.content : ""),
-      attachments: attachmentsOf(m)?.map((a, i) => ({ ...a, ref: [chatId, m.id, Date.parse(time) || 0, i].join("~") })),
-    };
-  });
+  return withReplyPreviews((body.data ?? body.messages ?? []).map((m: any) => toMessage(m, chatId)));
+}
+
+// Cliq marks mentions in text as {@<user id>}; channels/groups use {@all}, {@participants} etc.
+const mentionsOf = (text: string) => [...text.matchAll(/\{@([^}\s]+)\}/g)].map((x) => x[1]);
+
+// Reply/quote info appears under different keys depending on message type; read whichever is there.
+function replyOf(m: any): Message["replyTo"] {
+  const r = m.reply_to ?? m.replied_message ?? m.quoted_message ?? m.content?.reply_to ?? m.content?.quote ?? m.meta?.reply_to;
+  const id = typeof r === "object" && r ? r.id ?? r.message_id ?? r.msgid : r ?? m.reply_message_id ?? m.parent_message_id;
+  if (!id && !(r && typeof r === "object")) return undefined;
+  const text = typeof r === "object" && r ? r.content?.text ?? r.text ?? r.message : undefined;
+  return { id: id ? String(id) : undefined, sender: typeof r === "object" && r ? r.sender?.name : undefined, preview: text ? String(text).slice(0, 120) : undefined };
+}
+
+export function toMessage(m: any, chatId: string): Message {
+  const time = iso(m.time) ?? "";
+  const text: string = m.content?.text ?? m.content?.comment ?? (typeof m.content === "string" ? m.content : "") ?? "";
+  const mentions = mentionsOf(text);
+  return {
+    id: String(m.id),
+    chatId,
+    sender: m.sender?.name ?? m.sender?.id ?? "unknown",
+    senderId: m.sender?.id ? String(m.sender.id) : undefined,
+    time,
+    text,
+    attachments: attachmentsOf(m)?.map((a, i) => ({ ...a, ref: [chatId, m.id, Date.parse(time) || 0, i].join("~") })),
+    replyTo: replyOf(m),
+    mentions: mentions.length ? mentions : undefined,
+    edited: m.is_edited || m.edited || m.revision > 0 ? true : undefined,
+  };
+}
+
+// Fill reply previews from messages in the same page when Cliq only gave the replied-to id.
+export function withReplyPreviews(msgs: Message[]): Message[] {
+  const byId = new Map(msgs.map((m) => [m.id, m]));
+  for (const m of msgs) {
+    if (!m.replyTo?.id || m.replyTo.preview) continue;
+    const o = byId.get(m.replyTo.id);
+    if (o) m.replyTo = { ...m.replyTo, sender: o.sender, preview: o.text.slice(0, 120) };
+  }
+  return msgs;
 }
 
 // Re-fetch the message a ref points at (refs carry its time, so one small page finds it) and return the file.
@@ -131,12 +206,12 @@ export async function getHistory(
     const oldest = fresh.map((m) => Date.parse(m.time)).filter((t) => !isNaN(t)).sort((a, b) => a - b)[0];
     // Stop when Cliq has nothing older for us (short page, no new ids, or no usable timestamps).
     if (page.length < MAX_PAGE || fresh.length === 0 || oldest === undefined) {
-      return { messages: sortAsc([...seen.values()]), truncated: false };
+      return { messages: withReplyPreviews(sortAsc([...seen.values()])), truncated: false };
     }
     if (opts.from && oldest <= opts.from.getTime()) break;
     to = new Date(oldest - 1);
   }
-  const messages = sortAsc([...seen.values()]).slice(-opts.max);
+  const messages = withReplyPreviews(sortAsc([...seen.values()]).slice(-opts.max));
   const truncated = !opts.from || Date.parse(messages[0]?.time) > opts.from.getTime();
   return { messages, truncated, before: truncated ? messages[0]?.time : undefined };
 }
@@ -163,6 +238,30 @@ export async function downloadFile(user: ZohoUser, f: Attachment, maxBytes: numb
 
 export async function sendMessage(user: ZohoUser, chatId: string, text: string) {
   return call(user, `/chats/${encodeURIComponent(chatId)}/message`, { method: "POST", body: JSON.stringify({ text }) });
+}
+
+// The signed-in user's Cliq id. Inferred from direct chats: in a DM named after the other person, the
+// sender who isn't that person is you. Cached per user.
+const selfCache = new Map<string, { id?: string; name?: string }>();
+export async function whoAmI(user: ZohoUser): Promise<{ id?: string; name?: string }> {
+  const key = user.refreshToken;
+  const hit = selfCache.get(key);
+  if (hit?.id) return hit;
+  const dms = (await listChats(user, 200)).filter((c) => /^(dm|direct)/i.test(c.type ?? "")).slice(0, 5);
+  const votes = new Map<string, { n: number; name: string }>();
+  await mapLimit(dms, 3, async (c) => {
+    const msgs = await getMessages(user, c.id, { limit: 30 }).catch(() => [] as Message[]);
+    for (const m of msgs) {
+      if (!m.senderId || m.sender === c.name) continue;
+      const v = votes.get(m.senderId) ?? { n: 0, name: m.sender };
+      v.n++;
+      votes.set(m.senderId, v);
+    }
+  });
+  const best = [...votes.entries()].sort((a, b) => b[1].n - a[1].n)[0];
+  const me = best ? { id: best[0], name: best[1].name } : {};
+  selfCache.set(key, me);
+  return me;
 }
 
 // Run fn over items with at most `n` requests in flight, to stay under Cliq rate limits.

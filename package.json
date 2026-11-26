@@ -10,7 +10,8 @@
     "start:local": "node dist/src/index.js",
     "token": "node dist/scripts/get-refresh-token.js",
     "inspect": "npx @modelcontextprotocol/inspector",
-    "postinstall": "tsc"
+    "postinstall": "tsc",
+    "test": "vitest run"
   },
   "dependencies": {
     "@modelcontextprotocol/sdk": "^1.17.0",
@@ -19,7 +20,9 @@
     "@types/node": "^22.0.0",
     "cors": "^2.8.6",
     "dotenv": "^16.4.5",
+    "exceljs": "^4.4.0",
     "express": "^5.2.1",
+    "fflate": "^0.8.3",
     "mammoth": "^1.13.0",
     "typescript": "^5.5.0",
     "unpdf": "^1.8.1",
@@ -27,5 +30,8 @@
   },
   "engines": {
     "node": "22.x"
+  },
+  "devDependencies": {
+    "vitest": "^3.2.7"
   }
 }

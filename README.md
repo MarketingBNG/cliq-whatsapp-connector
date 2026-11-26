@@ -9,20 +9,25 @@ WhatsApp support will be added later.
 ## Tools
 | Tool | What it does |
 |---|---|
-| `summarize_chat` | **One step:** finds the chat by name, pulls history (default last 30 days), opens screenshots/files, redacts, returns a fixed short summary format |
-| `list_chats` | DMs, groups and channels the signed-in user is in; filter by `name` |
+| `summarize_chat` | **One step:** finds the chat by name (among all your chats), pulls history (default last 30 days), opens screenshots/files, redacts, returns a fixed short summary format |
+| `needs_attention` | Messages that @mention you since your last reply, and direct chats waiting on your reply |
+| `list_chats` | All DMs, groups and channels you're in (pages past Cliq's 100 limit, up to 1,000); filter by `name`/`type` |
 | `list_channels` | Cliq channels |
-| `get_messages` | Up to 100 messages from one chat (optional from/to window) |
+| `get_messages` | Up to 100 messages from one chat, with reply previews, mentions and edits; `olderCursor` pages back |
 | `get_chat_history` | **Full history** of 1–10 chats, paged back automatically (up to 5,000 per chat per call; continue for more) |
-| `read_attachments` | Opens files on messages: screenshots/images as images; PDF, Word, text and CSV as text (redacted) |
+| `read_attachments` | Opens files: images as images; PDF, Word, Excel, zip (files inside), text and CSV as text (redacted). Audio/video get a note only |
 | `recent_activity` | Every message across active chats in the last N hours |
-| `search_messages` | Words (all must match), `"exact phrases"`, sender name (`from`), one chat, `after`/`before` window (max 30 days). Also matches file names |
-| `connection_status` | Is the Zoho sign-in working, which data centre, how many chats visible |
+| `search_messages` | All words must match, `"exact phrases"`, sender (`from`), one chat, `after`/`before` (max 30 days). Matches file names; `include_files=true` also searches inside documents |
+| `connection_status` | Is the Zoho sign-in working, who you are, which data centre, how many chats visible |
+| `send_message` | Post to a chat. Only available when `CLIQ_ALLOW_SEND=true` |
 
 Prompts: `summarize_chat` and `find_commitments` appear in Claude's prompt menu.
 
 Like the WhatsApp connector, every tool is marked read-only, says when to use it / what it returns / its limits, warns Claude that message text is untrusted, and fails with a coded error plus a suggested next step (`AUTH_FAILED`, `INVALID_DATE_RANGE`, `RESPONSE_TOO_LARGE`, …) instead of raw API output.
-| `send_message` | Post to a chat. Only available when `CLIQ_ALLOW_SEND=true` |
+
+**Limits that keep Cliq happy:** the chat list is cached for a minute per user; search, `recent_activity` and `needs_attention` read at most the 120 most recently active chats per call and say how many they skipped.
+
+**Tests:** `npm test` (vitest).
 
 ## Sensitive data and answer style
 - **Hidden by default:** API keys, tokens, passwords, OTPs, private keys, card numbers, SSN, PAN and Aadhaar are replaced with `[REDACTED: type]` before Claude sees them. Claude is told to warn you to rotate exposed credentials.

@@ -3,9 +3,9 @@ import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import { z } from "zod";
 import { allowSend } from "./config.js";
 import { cliqBase, type ZohoUser } from "./zoho/auth.js";
-import { listChats, listChannels, getMessages, getHistory, sendMessage, mapLimit, findAttachment, downloadFile, type Message } from "./cliq/client.js";
-import { toContent, MAX_FILE_BYTES } from "./files.js";
-import { redactAll, redactionNotice } from "./redact.js";
+import { listChats, listChannels, getMessages, getHistory, sendMessage, mapLimit, findAttachment, downloadFile, whoAmI, type Message } from "./cliq/client.js";
+import { toContent, documentText, kindOf, MAX_FILE_BYTES } from "./files.js";
+import { redact, redactAll, redactionNotice } from "./redact.js";
 import { ToolError, toToolError, UNTRUSTED_NOTICE, TIME_NOTE } from "./errors.js";
 
 // Works out which Zoho user a tool call runs as: from the OAuth token (remote) or from .env (local stdio).
@@ -16,7 +16,8 @@ const INSTRUCTIONS = `Zoho Cliq connector. Rules for answers built from Cliq dat
 
 WHICH TOOL
 - "Summarise / brief me on / catch me up on my chat with X" -> call summarize_chat once with name=X. It already includes history, files and redaction; don't chain other tools unless the user asks for more.
-- "Find where we discussed X" / "what did Y send" -> search_messages, then get_messages around a hit for context.
+- "Find where we discussed X" / "what did Y send" -> search_messages (include_files=true to look inside documents), then get_messages around a hit for context.
+- "What needs my attention / reply?" -> needs_attention.
 - Empty results or an AUTH_FAILED error -> call connection_status and tell the user what it says.
 
 STYLE
@@ -88,15 +89,26 @@ const reveal = z
   .describe("Show hidden secrets/IDs. ONLY true after the user explicitly asked AND confirmed after a warning.");
 
 const line = (m: Message) =>
-  `[${m.time.slice(0, 16).replace("T", " ")}] ${m.sender}: ${m.text}` + (m.attachments ?? []).map((a) => ` [file: ${a.name} ref=${a.ref}]`).join("");
+  `[${m.time.slice(0, 16).replace("T", " ")}] ${m.sender}` +
+  (m.replyTo ? ` (reply to ${m.replyTo.sender ?? "a message"}${m.replyTo.preview ? `: "${m.replyTo.preview.slice(0, 60)}"` : ""})` : "") +
+  `: ${m.text}` + (m.edited ? " (edited)" : "") +
+  (m.attachments ?? []).map((a) => ` [file: ${a.name} ref=${a.ref}]`).join("");
 
 // Download URLs stay server-side; Claude only needs the name, type and ref.
 const publicMsg = (m: Message) => ({ ...m, attachments: m.attachments?.map(({ url, id, ...a }) => a) });
 
 // Messages from every chat active in [since, until] (or just one chat), tagged with the chat name, newest first.
-async function recent(user: ZohoUser, since: Date, perChat: number, until?: Date, onlyChat?: string): Promise<Message[]> {
-  const chats = (await listChats(user, 100)).filter((c) => (onlyChat ? c.id === onlyChat : !c.lastActivity || new Date(c.lastActivity) >= since));
-  if (onlyChat && chats.length === 0) throw new ToolError("CHAT_NOT_FOUND", `No chat with id ${onlyChat} among your 100 most recent chats.`);
+// At most this many chats are read per call, most recently active first, so one request can't fan out into
+// hundreds of Cliq calls (rate limits, timeouts). Callers report chatsSkipped so Claude can say coverage was partial.
+export const MAX_SCAN_CHATS = 120;
+
+async function recent(user: ZohoUser, since: Date, perChat: number, until?: Date, onlyChat?: string) {
+  const all = await listChats(user);
+  const active = onlyChat
+    ? all.filter((c) => c.id === onlyChat)
+    : all.filter((c) => c.lastActivity && new Date(c.lastActivity) >= since);
+  if (onlyChat && active.length === 0) active.push({ id: onlyChat, name: onlyChat, type: "" }); // not listed: let Cliq decide
+  const chats = active.slice(0, MAX_SCAN_CHATS);
   const batches = await mapLimit(chats, 4, async (c) => {
     try {
       return (await getMessages(user, c.id, { from: since, to: until, limit: perChat })).map((m) => ({ ...m, chat: c.name }));
@@ -104,12 +116,16 @@ async function recent(user: ZohoUser, since: Date, perChat: number, until?: Date
       return [];
     }
   });
-  return batches.flat().sort((a, b) => b.time.localeCompare(a.time));
+  return {
+    messages: batches.flat().sort((a, b) => b.time.localeCompare(a.time)),
+    chatsScanned: chats.length,
+    chatsSkipped: active.length - chats.length,
+  };
 }
 
 // Search terms: "quoted phrases" must appear as written; other words must all appear, each matching the
 // start of a word (so "invoice" also finds "invoices"). Case-insensitive.
-function matcher(query: string): (text: string) => boolean {
+export function matcher(query: string): (text: string) => boolean {
   const phrases = [...query.matchAll(/"([^"]+)"/g)].map((m) => m[1].toLowerCase().trim()).filter(Boolean);
   const words = query.replace(/"[^"]*"/g, " ").toLowerCase().split(/\s+/).filter(Boolean);
   const esc = (w: string) => w.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -152,7 +168,7 @@ const merge = (a: Record<string, number>, b: Record<string, number>) => {
 };
 
 export function buildServer(resolve: UserResolver): McpServer {
-  const server = new McpServer({ name: "zoho-cliq", version: "0.5.0" }, { instructions: INSTRUCTIONS });
+  const server = new McpServer({ name: "zoho-cliq", version: "0.6.0" }, { instructions: INSTRUCTIONS });
   const text = (t: string): Part => ({ type: "text", text: t });
 
   server.registerTool(
@@ -161,7 +177,7 @@ export function buildServer(resolve: UserResolver): McpServer {
       description: describe({
         when: 'The user asks to summarise / brief / catch up on a chat with a person, group or channel ("catch me up with Karan"). One call is enough.',
         returns: "The answer format to follow, the chat's messages for the period (default last 30 days), then the newest screenshots/files already opened. Secrets are redacted.",
-        limits: "Looks among your 100 most recent chats; if several match it returns the candidates so you can ask which one.",
+        limits: "Looks through all your chats (up to 1,000); if several match it returns the candidates so you can ask which one.",
       }),
       inputSchema: {
         name: z.string().min(1).describe("Person, group or channel name, e.g. 'Karan'"),
@@ -178,10 +194,10 @@ export function buildServer(resolve: UserResolver): McpServer {
 
       // 1. Find the chat. Prefer an exact name match; if still ambiguous, ask instead of guessing.
       const q = name.toLowerCase();
-      const hits = (await listChats(user, 100)).filter((c) => c.name?.toLowerCase().includes(q));
+      const hits = (await listChats(user)).filter((c) => c.name?.toLowerCase().includes(q));
       const exact = hits.filter((c) => c.name?.toLowerCase() === q);
       const pick = exact.length === 1 ? exact : hits;
-      if (pick.length === 0) return { content: [text(`No chat matching "${name}" among your 100 most recent chats. Ask the user for the exact chat name.`)] };
+      if (pick.length === 0) return { content: [text(`No chat matching "${name}" among your chats. Ask the user for the exact chat name.`)] };
       if (pick.length > 1)
         return { content: [text(`Several chats match "${name}". Ask the user which one (one short question), then call again with the exact name:\n` + pick.map((c) => `- ${c.name} (${c.type})`).join("\n"))] };
       const chat = pick[0];
@@ -225,20 +241,20 @@ export function buildServer(resolve: UserResolver): McpServer {
       description: describe({
         when: "To find a chat id by person, group or channel name, or to see which chats were active recently.",
         returns: "Chats newest-first: id, name, type (dm, chat, channel), lastActivity. Next: get_messages or get_chat_history with the id.",
-        limits: "Your 100 most recent chats.",
+        limits: "Searches all your chats (up to 1,000); returns up to `limit` of the matches.",
       }),
       inputSchema: {
         name: z.string().optional().describe("Filter by chat or person name (case-insensitive, partial match)"),
         type: z.string().optional().describe("Filter by chat type, e.g. dm, chat, channel"),
-        limit: z.number().int().min(1).max(100).default(100),
+        limit: z.number().int().min(1).max(1000).default(100),
       },
       annotations: READ_ONLY,
     },
     run(async ({ name, type, limit }, { authInfo }) => {
-      let chats = await listChats(resolve(authInfo), limit);
+      let chats = await listChats(resolve(authInfo));
       if (name) chats = chats.filter((c) => c.name?.toLowerCase().includes(name.toLowerCase()));
       if (type) chats = chats.filter((c) => c.type?.toLowerCase().includes(type.toLowerCase()));
-      return ok(chats);
+      return ok({ total: chats.length, shown: Math.min(limit, chats.length), chats: chats.slice(0, limit) });
     }),
   );
 
@@ -261,7 +277,7 @@ export function buildServer(resolve: UserResolver): McpServer {
     {
       description: describe({
         when: "To read a short stretch of one chat, e.g. around a search hit (set from/to around its time).",
-        returns: "Up to 100 messages with sender, time, text and attachments (each with a ref for read_attachments); the window used is echoed back. Secrets are redacted.",
+        returns: "Up to 100 messages (oldest first) with sender, time, text, replyTo (what a reply answers), mentions and attachments (each with a ref for read_attachments); the window used is echoed back. Pass olderCursor as `cursor` for the page before. Secrets are redacted.",
         limits: "Max 100; for longer periods use get_chat_history. An empty list means no messages in that window, not an error.",
       }),
       inputSchema: {
@@ -269,16 +285,19 @@ export function buildServer(resolve: UserResolver): McpServer {
         from: z.string().optional().describe("ISO start time"),
         to: z.string().optional().describe("ISO end time"),
         limit: z.number().int().min(1).max(100).default(50),
+        cursor: z.string().optional().describe("olderCursor from a previous call: returns the page before it"),
         reveal_sensitive: reveal,
       },
       annotations: READ_ONLY,
     },
-    run(async ({ chat_id, from, to, limit, reveal_sensitive }, { authInfo }) => {
-      const r = range(from, to);
-      const msgs = await getMessages(resolve(authInfo), chat_id, { ...r, limit });
+    run(async ({ chat_id, from, to, limit, cursor, reveal_sensitive }, { authInfo }) => {
+      const r = range(from, cursor ?? to, ["from", cursor ? "cursor" : "to"]);
+      const msgs = (await getMessages(resolve(authInfo), chat_id, { ...r, limit })).sort((a, b) => a.time.localeCompare(b.time));
       const red = redactAll(msgs, reveal_sensitive);
+      const oldest = Date.parse(msgs[0]?.time ?? "");
+      const olderCursor = msgs.length >= limit && !isNaN(oldest) ? new Date(oldest - 1).toISOString() : undefined;
       return ok(
-        { window: { from: r.from?.toISOString(), to: r.to?.toISOString() }, count: red.items.length, messages: red.items.map(publicMsg) },
+        { window: { from: r.from?.toISOString(), to: r.to?.toISOString() }, count: red.items.length, olderCursor, messages: red.items.map(publicMsg) },
         redactionNotice(red.found),
       );
     }),
@@ -305,7 +324,7 @@ export function buildServer(resolve: UserResolver): McpServer {
     run(async ({ chat_ids, from, to, max_per_chat, format, reveal_sensitive }, { authInfo }) => {
       const user = resolve(authInfo);
       const r = range(from, to);
-      const names = new Map((await listChats(user, 100).catch(() => [])).map((c) => [c.id, c.name]));
+      const names = new Map((await listChats(user).catch(() => [])).map((c) => [c.id, c.name]));
       const found: Record<string, number> = {};
       const results = await mapLimit(chat_ids, 3, async (id) => {
         try {
@@ -347,8 +366,12 @@ export function buildServer(resolve: UserResolver): McpServer {
       annotations: READ_ONLY,
     },
     run(async ({ hours, per_chat, reveal_sensitive }, { authInfo }) => {
-      const red = redactAll(await recent(resolve(authInfo), new Date(Date.now() - hours * 3600_000), per_chat), reveal_sensitive);
-      return ok({ hours, count: red.items.length, messages: red.items.map(publicMsg) }, redactionNotice(red.found));
+      const rec = await recent(resolve(authInfo), new Date(Date.now() - hours * 3600_000), per_chat);
+      const red = redactAll(rec.messages, reveal_sensitive);
+      return ok(
+        { hours, chatsScanned: rec.chatsScanned, chatsSkipped: rec.chatsSkipped, count: red.items.length, messages: red.items.map(publicMsg) },
+        redactionNotice(red.found),
+      );
     }),
   );
 
@@ -360,7 +383,7 @@ export function buildServer(resolve: UserResolver): McpServer {
         returns: "Matches newest-first with chat, chatId, time, sender, text and file refs, plus the window searched and the total. Next: get_messages with that chatId and from/to around the time, for context.",
         limits:
           "Cliq has no search API, so this scans chats active in the window (default last 3 days, max 30 days). All words must match (case-insensitive; a word also matches longer words starting with it). " +
-          "Matches message text and file names, not text inside files. Try synonyms in separate calls. Redacted values can't be searched. Default 20 results, max 50.",
+          "Matches message text and file names; with include_files=true also the text inside PDF, Word, Excel, zip and text files in the window (up to max_files, newest first; not images or audio). Try synonyms in separate calls. Redacted values can't be searched. Default 20 results, max 50.",
       }),
       inputSchema: {
         query: z.string().max(200).optional().describe('Words to find; "double quotes" for an exact phrase. Optional when `from` is given.'),
@@ -370,27 +393,67 @@ export function buildServer(resolve: UserResolver): McpServer {
         before: z.string().optional().describe("ISO end time; default now"),
         hours: z.number().positive().max(720).optional().describe("Alternative to `after`: look back this many hours"),
         limit: z.number().int().min(1).max(50).default(20),
+        include_files: z.boolean().default(false).describe("Also search the text inside documents (slower)"),
+        max_files: z.number().int().min(1).max(30).default(15).describe("With include_files: how many documents to open, newest first"),
         reveal_sensitive: reveal,
       },
       annotations: READ_ONLY,
     },
-    run(async ({ query, from, chat_id, after, before, hours, limit, reveal_sensitive }, { authInfo }) => {
+    run(async ({ query, from, chat_id, after, before, hours, limit, include_files, max_files, reveal_sensitive }, { authInfo }) => {
+      const user = resolve(authInfo);
       if (!query?.trim() && !from) throw new ToolError("INVALID_INPUT", "Give `query`, `from`, or both.");
       const r = range(after, before, ["after", "before"]);
       const since = r.from ?? new Date((r.to?.getTime() ?? Date.now()) - (hours ?? 72) * 3600_000);
       if (Date.now() - since.getTime() > 30 * 86400_000) throw new ToolError("INVALID_INPUT", "The search window can reach back at most 30 days; move `after` later.");
       // Redact first, so a search can't be used to probe hidden values.
-      const red = redactAll(await recent(resolve(authInfo), since, 100, r.to, chat_id), reveal_sensitive);
+      const rec = await recent(user, since, 100, r.to, chat_id);
+      const red = redactAll(rec.messages, reveal_sensitive);
       const match = query?.trim() ? matcher(query) : () => true;
       const who = from?.toLowerCase();
-      const all = red.items.filter(
-        (m) => (!who || m.sender.toLowerCase().includes(who)) && match([m.text, ...(m.attachments ?? []).map((a) => a.name)].join(" ")),
+      const bySender = red.items.filter((m) => !who || m.sender.toLowerCase().includes(who));
+      const all: (Message & { matchedIn?: string; snippet?: string })[] = bySender.filter((m) =>
+        match([m.text, ...(m.attachments ?? []).map((a) => a.name)].join(" ")),
       );
+      let filesOpened = 0;
+      if (include_files && query?.trim()) {
+        // Open documents (newest first) on messages that didn't already match, and search their redacted text.
+        const done = new Set(all.map((m) => m.id));
+        const docs = bySender
+          .filter((m) => !done.has(m.id))
+          .flatMap((m) => (m.attachments ?? []).filter((a) => ["pdf", "docx", "xlsx", "zip", "text"].includes(kindOf(a.name, a.type))).map((a) => ({ m, a })))
+          .slice(0, max_files);
+        filesOpened = docs.length;
+        const first = query.replace(/"/g, " ").toLowerCase().split(/\s+/).filter(Boolean)[0] ?? "";
+        const opened = await mapLimit(docs, 3, async ({ m, a }) => {
+          try {
+            const f = await downloadFile(user, a, MAX_FILE_BYTES);
+            const t = await documentText(f.data, kindOf(a.name, f.contentType));
+            if (!t) return null;
+            const safe = reveal_sensitive ? t : redact(t).text;
+            if (!match(safe)) return null;
+            const i = Math.max(0, safe.toLowerCase().indexOf(first));
+            return { ...m, matchedIn: `file: ${a.name}`, snippet: safe.slice(Math.max(0, i - 80), i + 160).replace(/\s+/g, " ") };
+          } catch {
+            return null;
+          }
+        });
+        for (const h of opened) if (h && !done.has(h.id)) (all.push(h), done.add(h.id));
+        all.sort((a, b) => b.time.localeCompare(a.time));
+      }
       const hits = all.slice(0, limit);
       const found: Record<string, number> = {};
       for (const m of hits) for (const [, k] of m.text.matchAll(/\[REDACTED: ([^\]]+)\]/g)) found[k] = (found[k] ?? 0) + 1;
       return ok(
-        { window: { after: since.toISOString(), before: (r.to ?? new Date()).toISOString() }, total: all.length, shown: hits.length, hasMore: all.length > hits.length, matches: hits.map(publicMsg) },
+        {
+          window: { after: since.toISOString(), before: (r.to ?? new Date()).toISOString() },
+          total: all.length,
+          shown: hits.length,
+          hasMore: all.length > hits.length,
+          chatsScanned: rec.chatsScanned,
+          ...(rec.chatsSkipped ? { chatsSkipped: rec.chatsSkipped, note: "Older-active chats were not scanned; narrow the window or pass chat_id." } : {}),
+          ...(include_files ? { filesOpened } : {}),
+          matches: hits.map((m) => ({ ...publicMsg(m), ...(m.matchedIn ? { matchedIn: m.matchedIn, snippet: m.snippet } : {}) })),
+        },
         redactionNotice(found),
       );
     }),
@@ -415,6 +478,52 @@ export function buildServer(resolve: UserResolver): McpServer {
   );
 
   server.registerTool(
+    "needs_attention",
+    {
+      description: describe({
+        when: 'The user asks what needs their attention or reply ("what am I missing?", "who is waiting on me?", "where was I mentioned?").',
+        returns:
+          "mentions: messages that @mention you (or @all) after your last message in that chat; waitingOnYou: direct chats whose last message is from the other person, with that message. Newest first. Secrets are redacted.",
+        limits: "Chats active in the last N hours (default 72, max 336). Who 'you' are is inferred from your direct chats; if it can't be, waitingOnYou is empty.",
+      }),
+      inputSchema: { hours: z.number().positive().max(336).default(72), per_chat: z.number().int().min(5).max(100).default(30) },
+      annotations: READ_ONLY,
+    },
+    run(async ({ hours, per_chat }, { authInfo }) => {
+      const user = resolve(authInfo);
+      const since = new Date(Date.now() - hours * 3600_000);
+      const [me, chats] = await Promise.all([whoAmI(user), listChats(user)]);
+      const allActive = chats.filter((c) => c.lastActivity && new Date(c.lastActivity) >= since);
+      const active = allActive.slice(0, MAX_SCAN_CHATS);
+      const mine = (m: Message) => (me.id ? m.senderId === me.id : false);
+      const per = await mapLimit(active, 4, async (c) => {
+        const msgs = (await getMessages(user, c.id, { from: since, limit: per_chat }).catch(() => [] as Message[])).sort((a, b) => a.time.localeCompare(b.time));
+        const lastMine = msgs.map(mine).lastIndexOf(true);
+        const after = msgs.slice(lastMine + 1).map((m) => ({ ...m, chat: c.name }));
+        const mentions = after.filter((m) => m.mentions?.some((x) => x === me.id || /^(all|participants|channel|here)$/i.test(x)));
+        const last = msgs.at(-1);
+        const isDm = /^(dm|direct)/i.test(c.type ?? "");
+        const waiting = isDm && last && me.id && !mine(last) ? [{ ...last, chat: c.name }] : [];
+        return { mentions, waiting };
+      });
+      const newest = (xs: Message[]) => redactAll(xs.sort((a, b) => b.time.localeCompare(a.time)), false);
+      const m = newest(per.flatMap((p) => p.mentions));
+      const w = newest(per.flatMap((p) => p.waiting));
+      return ok(
+        {
+          window: { after: since.toISOString() },
+          you: me.name ?? "(could not be inferred)",
+          chatsChecked: active.length,
+          ...(allActive.length > active.length ? { chatsSkipped: allActive.length - active.length } : {}),
+          mentions: m.items.map(publicMsg),
+          waitingOnYou: w.items.map((x) => ({ chat: x.chat, chatId: x.chatId, from: x.sender, time: x.time, lastMessage: x.text.slice(0, 300) })),
+        },
+        redactionNotice(merge({ ...m.found }, w.found)),
+      );
+    }),
+  );
+
+  server.registerTool(
     "connection_status",
     {
       description:
@@ -428,8 +537,9 @@ export function buildServer(resolve: UserResolver): McpServer {
       let user: ZohoUser | undefined;
       try {
         user = resolve(authInfo);
-        const chats = await listChats(user, 100);
-        return ok({ connected: true, accountsServer: user.accountsServer, cliqApi: cliqBase(user), recentChatsVisible: chats.length, asOf: new Date().toISOString() });
+        const chats = await listChats(user);
+        const me = await whoAmI(user).catch(() => ({ name: undefined }));
+        return ok({ connected: true, you: me.name, accountsServer: user.accountsServer, cliqApi: cliqBase(user), chatsVisible: chats.length, asOf: new Date().toISOString() });
       } catch (e) {
         return ok({
           connected: false,
@@ -491,7 +601,7 @@ function registerPrompts(server: McpServer) {
       user(
         [
           `Find commitments, deadlines and unanswered questions in my Zoho Cliq chats for ${period ?? "the last 7 days"}.`,
-          "Steps: recent_activity for the window; search_messages for words like tomorrow, deadline, \"will send\", EOD; open relevant files with read_attachments.",
+          "Steps: needs_attention for the window; recent_activity for the window; search_messages for words like tomorrow, deadline, \"will send\", EOD; open relevant files with read_attachments.",
           "Output a table: who, what, due date (if stated), chat, message date.",
           GROUND_RULES,
         ].join("\n"),
