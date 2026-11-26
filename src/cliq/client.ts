@@ -165,7 +165,7 @@ export function toMessage(m: any, chatId: string): Message {
     attachments: attachmentsOf(m)?.map((a, i) => ({ ...a, ref: [chatId, m.id, Date.parse(time) || 0, i].join("~") })),
     replyTo: replyOf(m),
     mentions: mentions.length ? mentions : undefined,
-    edited: m.is_edited || m.edited || m.revision > 0 ? true : undefined,
+    edited: m.is_edited === true || m.edited === true ? true : undefined,
   };
 }
 
