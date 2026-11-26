@@ -16,6 +16,6 @@ services:
       - key: ZOHO_CLIENT_SECRET
         sync: false
       - key: ZOHO_DC
-        value: com
+        value: in
       - key: CLIQ_ALLOW_SEND
         value: "false"

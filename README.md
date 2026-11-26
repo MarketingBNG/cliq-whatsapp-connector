@@ -16,7 +16,12 @@ WhatsApp support will be added later.
 | `get_chat_history` | **Full history** of 1–10 chats, paged back automatically (up to 5,000 per chat per call; continue for more) |
 | `read_attachments` | Opens files on messages: screenshots/images as images; PDF, Word, text and CSV as text (redacted) |
 | `recent_activity` | Every message across active chats in the last N hours |
-| `search_messages` | Text or sender search over the last N hours |
+| `search_messages` | Words (all must match), `"exact phrases"`, sender name (`from`), one chat, `after`/`before` window (max 30 days). Also matches file names |
+| `connection_status` | Is the Zoho sign-in working, which data centre, how many chats visible |
+
+Prompts: `summarize_chat` and `find_commitments` appear in Claude's prompt menu.
+
+Like the WhatsApp connector, every tool is marked read-only, says when to use it / what it returns / its limits, warns Claude that message text is untrusted, and fails with a coded error plus a suggested next step (`AUTH_FAILED`, `INVALID_DATE_RANGE`, `RESPONSE_TOO_LARGE`, …) instead of raw API output.
 | `send_message` | Post to a chat. Only available when `CLIQ_ALLOW_SEND=true` |
 
 ## Sensitive data and answer style
